@@ -96,7 +96,6 @@ final class ShopDomain implements ShopDomainValue
                 return self::fromNative($result);
             }
         }
-
         // No shop domain found in any source
         return NullShopDomain::fromNative(null);
     }

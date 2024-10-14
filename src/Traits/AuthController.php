@@ -30,8 +30,9 @@ trait AuthController
     public function authenticate(Request $request, AuthenticateShop $authShop)
     {
         if ($request->missing('shop') && !$request->user()) {
+            return \redirect('/login');
             // One or the other is required to authenticate a shop
-            throw new MissingShopDomainException('No authenticated user or shop domain');
+//            throw new MissingShopDomainException('No authenticated user or shop domain');
         }
 
         // Get the shop domain

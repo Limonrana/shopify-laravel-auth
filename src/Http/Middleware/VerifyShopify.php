@@ -81,19 +81,23 @@ class VerifyShopify
      * Undocumented function.
      *
      * @param Request $request The request object.
-     * @param Closure $next    The next action.
+     * @param Closure $next The next action.
+     * @param mixed ...$guards
      *
-     * @throws SignatureVerificationException|HttpException If HMAC verification fails.
+     * @throws HttpException If HMAC verification fails.
+     * @throws SignatureVerificationException If HMAC verification fails.
      *
      * @return mixed
      */
-    public function handle(Request $request, Closure $next)
+    public function handle(Request $request, Closure $next, ...$guards): mixed
     {
-        // Verify the HMAC (if available)
-        $hmacResult = $this->verifyHmac($request);
-        if ($hmacResult === false) {
-            // Invalid HMAC
-            throw new SignatureVerificationException('Unable to verify signature.');
+        // Set the previous shop (if available)
+        if ($request->user()) {
+            $this->previousShop = $request->user();
+        }
+        // Check if auth is exist
+        if ($this->auth->user() !== null && !$this->previousShop) {
+            $this->previousShop = $this->auth->user();
         }
 
         // Continue if current route is an auth or billing route
@@ -101,49 +105,65 @@ class VerifyShopify
             return $next($request);
         }
 
-        if (!Util::useNativeAppBridge()) {
-            $shop = $this->getShopIfAlreadyInstalled($request);
-            $storeResult = !$this->isApiRequest($request) && $shop;
-
-            if ($storeResult) {
-                $this->loginFromShop($shop);
-
-                return $next($request);
+        // Check previous shop or auth the check installation
+        if (!$this->previousShop) {
+            $shop = $this->checkPreviousInstallation($request);
+            if (!$shop) {
+                // Shop is not installed redirect for installation
+                return $this->handleInvalidShop($request);
             }
         }
 
-        $tokenSource = $this->getAccessTokenFromRequest($request);
+        // check api request
+        $isNotApiRequest = !$this->isApiRequest($request);
 
-        if ($tokenSource === null) {
-            //Check if there is a store record in the database
-            return $this->checkPreviousInstallation($request)
-                // Shop exists, token not available, we need to get one
-                ? $this->handleMissingToken($request)
-                // Shop does not exist
-                : $this->handleInvalidShop($request);
+        // Check authorization guard
+        $isGuard = $this->authenticate($guards);
+        if (!$isGuard) {
+            if ($isNotApiRequest) {
+                // Verify the HMAC (if available)
+                $hmacResult = $this->verifyHmac($request);
+                if ($hmacResult === false) {
+                    // Invalid HMAC
+                    throw new SignatureVerificationException('HMAC null or Unable to verify signature.');
+                }
+            }
+            if ($this->previousShop === null) {
+                $this->previousShop = $this->getShopIfAlreadyInstalled($request);
+            }
+            // Login the shop
+            $loginResult = $this->loginFromShop($this->previousShop);
+            if (! $loginResult) {
+                // Shop is not installed or something is missing from its data
+                return $this->handleInvalidShop($request);
+            }
+            if ($isNotApiRequest) {
+                // check host is available and verify
+                $isHost = $this->verifyHost($request);
+                if ($isHost === null) {
+                    // host not found
+                    throw new SignatureVerificationException('Host not found!', 400);
+                }
+                if ($isHost === false) {
+                    // host not valid
+                    throw new SignatureVerificationException('Host Unable to verify signature.', 400);
+                }
+            }
         }
 
-        try {
-            // Try and process the token
-            $token = SessionToken::fromNative($tokenSource);
-        } catch (AssertionFailedException $e) {
-            // Invalid or expired token, we need a new one
-            return $this->handleInvalidToken($request, $e);
-        }
+        // check api request is available
+        if ($isNotApiRequest && $request->path() === '/') {
+            $shop_domain = $this->previousShop->name;
+            $shop_name = collect(explode('.myshopify.com', $shop_domain))->first();
+            $host = Util::base64UrlEncode('admin.shopify.com/store/'.$shop_name);
+            $redirect = "/dashboard?host={$host}&shop={$shop_domain}";
+            // check shopify domain used in global prefix or not
+            if (Util::getShopifyConfig('shopify_tenant')) {
+                $shopUrl = Str::slug(Str::replace('.', '-', $shop_name), '-');
+                $redirect = "/{$shopUrl}/dashboard?host={$host}&shop={$shop_domain}";
+            }
 
-        // Set the previous shop (if available)
-        if ($request->user()) {
-            $this->previousShop = $request->user();
-        }
-
-        // Login the shop
-        $loginResult = $this->loginShopFromToken(
-            $token,
-            NullableSessionId::fromNative($request->query('session'))
-        );
-        if (! $loginResult) {
-            // Shop is not installed or something is missing from it's data
-            return $this->handleInvalidShop($request);
+            return redirect($redirect);
         }
 
         return $next($request);
@@ -209,6 +229,26 @@ class VerifyShopify
         }
 
         return $this->installRedirect(ShopDomain::fromRequest($request));
+    }
+
+    /**
+     * Verify Host data, if present.
+     *
+     * @param Request $request The request object.
+     *
+     * @return bool|null
+     */
+    protected function verifyHost(Request $request): ?bool
+    {
+        $host = $request->query('host');
+        if (isset($host)) {
+            $shop_name = collect(explode('.myshopify.com', $this->previousShop->name))->first();
+            $validHost = Util::base64UrlEncode('admin.shopify.com/store/'.$shop_name);
+
+            return $validHost === $host;
+        }
+
+        return null;
     }
 
     /**
@@ -512,6 +552,9 @@ class VerifyShopify
     protected function checkPreviousInstallation(Request $request): bool
     {
         $shop = $this->shopQuery->getByDomain(ShopDomain::fromRequest($request), [], true);
+        if ($shop) {
+            $this->previousShop = $shop;
+        }
 
         return $shop && $shop->password && ! $shop->trashed();
     }
@@ -531,13 +574,36 @@ class VerifyShopify
     }
 
     /**
+     * Determine if the user is logged in to any of the given guards.
+     *
+     * @param  array  $guards
+     *
+     * @return bool
+     */
+    protected function authenticate(array $guards): bool
+    {
+        if (empty($guards)) {
+            $guards = [null];
+        }
+        foreach ($guards as $guard) {
+            if ($this->auth->guard($guard)->check()) {
+                $this->auth->shouldUse($guard);
+
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
      * Login and validate store
      *
      * @param ShopModel $shop
      *
-     * @return void
+     * @return bool
      */
-    protected function loginFromShop(ShopModel $shop): void
+    protected function loginFromShop(ShopModel $shop): bool
     {
         // Override auth guard
         if (($guard = Util::getShopifyConfig('shop_auth_guard'))) {
@@ -546,5 +612,7 @@ class VerifyShopify
 
         // All is well, login the shop
         $this->auth->login($shop);
+
+        return true;
     }
 }
