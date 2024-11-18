@@ -2,7 +2,7 @@
 
 namespace Osiset\ShopifyApp\Test\Traits;
 
-use App\Jobs\OrdersCreateJob;
+use App\Jobs\Webhooks\Shopify\OrdersCreateJob;
 use Illuminate\Http\Response;
 use Illuminate\Support\Facades\Config;
 use Illuminate\Support\Facades\Queue;
